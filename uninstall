@@ -1,0 +1,14 @@
+#!/bin/bash
+
+set -euo pipefail
+
+plugin_root="$(cd "$(dirname "$0")" && pwd)"
+desktop_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+desktop_file="$desktop_dir/io.github.timsweetman1.whoop.desktop"
+
+"$plugin_root/bin/whoop-bridge" disconnect
+rm -f "$desktop_file"
+update-desktop-database "$desktop_dir"
+
+printf 'Local WHOOP credentials, cached metrics, and the callback handler were removed.\n'
+printf 'You can now run: omarchy plugin remove io.github.timsweetman1.whoop\n'

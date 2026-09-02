@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+
+import argparse
+import getpass
+import json
+import os
+import secrets
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+SERVICE = "omarchy-whoop"
+AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
+TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
+API_ROOT = "https://api.prod.whoop.com/developer/v2"
+REDIRECT_URI = "whoop://omarchy-whoop/callback"
+SCOPES = ["offline", "read:recovery", "read:cycles", "read:sleep"]
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / SERVICE
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / SERVICE
+STATE_FILE = STATE_DIR / "latest.json"
+CALLBACK_LOG = STATE_DIR / "callback.log"
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def read_json(path: Path, default=None):
+    if not path.exists():
+        return {} if default is None else default
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def write_private_json(path: Path, value) -> None:
+    ensure_private_dir(path.parent)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    temp.chmod(0o600)
+    temp.replace(path)
+
+
+def log_callback(message: str) -> None:
+    ensure_private_dir(STATE_DIR)
+    with CALLBACK_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(f"{datetime.now(timezone.utc).isoformat()} {message}\n")
+    CALLBACK_LOG.chmod(0o600)
+
+
+def keyring_lookup(key: str) -> str:
+    result = subprocess.run(
+        ["secret-tool", "lookup", "service", SERVICE, "key", key],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def keyring_store(key: str, value: str) -> None:
+    subprocess.run(
+        [
+            "secret-tool",
+            "store",
+            f"--label=Omarchy WHOOP {key}",
+            "service",
+            SERVICE,
+            "key",
+            key,
+        ],
+        input=value,
+        text=True,
+        check=True,
+    )
+
+
+def keyring_clear(key: str) -> None:
+    subprocess.run(
+        ["secret-tool", "clear", "service", SERVICE, "key", key],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def load_config() -> dict:
+    return read_json(CONFIG_FILE)
+
+
+def save_config(config: dict) -> None:
+    write_private_json(CONFIG_FILE, config)
+
+
+class WhoopHttpError(RuntimeError):
+    def __init__(self, status: int, detail: str):
+        super().__init__(f"WHOOP HTTP {status}: {detail[:500]}")
+        self.status = status
+
+
+def curl_json(url: str, method: str = "GET", fields=None, bearer: str = "") -> dict:
+    command = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--request",
+        method,
+        "--header",
+        "Accept: application/json",
+        "--write-out",
+        "\n%{http_code}",
+    ]
+    request_input = ""
+    if fields is not None:
+        command.extend(
+            [
+                "--header",
+                "Content-Type: application/x-www-form-urlencoded",
+                "--data-binary",
+                "@-",
+                "--url",
+                url,
+            ]
+        )
+        request_input = urllib.parse.urlencode(fields)
+    else:
+        # Feed the bearer token through curl's stdin config so it never appears
+        # in the process list. GET requests have no body, so stdin is available.
+        safe_url = url.replace('"', "")
+        safe_token = bearer.replace('"', "")
+        command.extend(["--config", "-"])
+        request_input = (
+            f'url = "{safe_url}"\n'
+            f'header = "Authorization: Bearer {safe_token}"\n'
+        )
+    result = subprocess.run(
+        command,
+        input=request_input,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    raw, separator, status_text = result.stdout.rpartition("\n")
+    if not separator or not status_text.isdigit():
+        raise RuntimeError(f"WHOOP request failed: {result.stderr.strip() or 'invalid response'}")
+    status = int(status_text)
+    if status >= 400:
+        raise WhoopHttpError(status, raw.strip() or result.stderr.strip())
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("WHOOP returned invalid JSON") from error
+
+
+def token_request(fields: dict) -> dict:
+    return curl_json(TOKEN_URL, method="POST", fields=fields)
+
+
+def save_tokens(payload: dict) -> None:
+    access_token = payload.get("access_token", "")
+    if not access_token:
+        raise RuntimeError("WHOOP did not return an access token")
+    keyring_store("access-token", access_token)
+    if payload.get("refresh_token"):
+        keyring_store("refresh-token", payload["refresh_token"])
+    config = load_config()
+    config["token_expires_at"] = int(time.time()) + int(payload.get("expires_in", 3600))
+    config["authorized_scopes"] = payload.get("scope", " ".join(SCOPES)).split()
+    config.pop("pending_state", None)
+    config.pop("pending_state_expires_at", None)
+    save_config(config)
+
+
+def refresh_access_token() -> str:
+    config = load_config()
+    client_id = config.get("client_id", "")
+    client_secret = keyring_lookup("client-secret")
+    refresh_token = keyring_lookup("refresh-token")
+    if not (client_id and client_secret and refresh_token):
+        raise RuntimeError("WHOOP authorization is incomplete")
+    payload = token_request(
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": " ".join(SCOPES),
+        }
+    )
+    save_tokens(payload)
+    return payload["access_token"]
+
+
+def current_access_token() -> str:
+    config = load_config()
+    token = keyring_lookup("access-token")
+    if token and int(config.get("token_expires_at", 0)) > int(time.time()) + 60:
+        return token
+    return refresh_access_token()
+
+
+def api_get(path: str, token: str) -> dict:
+    try:
+        return curl_json(API_ROOT + path, bearer=token)
+    except WhoopHttpError as error:
+        if error.status != 401:
+            raise
+        token = refresh_access_token()
+        return curl_json(API_ROOT + path, bearer=token)
+
+
+def first_record(payload: dict, predicate=lambda item: True) -> dict:
+    for item in payload.get("records", []):
+        if predicate(item):
+            return item
+    return {}
+
+
+def hours(milliseconds):
+    if not isinstance(milliseconds, (int, float)):
+        return None
+    return round(milliseconds / 3_600_000, 2)
+
+
+def compact_summary(recovery: dict, cycle: dict, sleep: dict) -> dict:
+    recovery_score = recovery.get("score") or {}
+    cycle_score = cycle.get("score") or {}
+    sleep_score = sleep.get("score") or {}
+    stages = sleep_score.get("stage_summary") or {}
+    sleep_segments = [
+        stages.get("total_light_sleep_time_milli"),
+        stages.get("total_slow_wave_sleep_time_milli"),
+        stages.get("total_rem_sleep_time_milli"),
+    ]
+    sleep_duration = hours(sum(value or 0 for value in sleep_segments)) if any(
+        isinstance(value, (int, float)) for value in sleep_segments
+    ) else None
+    result = {
+        "source": "WHOOP API v2",
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "authorized_metrics": [
+            "recovery_score",
+            "hrv_rmssd_milli",
+            "day_strain",
+            "sleep_performance_percentage",
+            "sleep_duration_hours",
+        ],
+        "recovery": {
+            "score_state": recovery.get("score_state"),
+            "recovery_score": recovery_score.get("recovery_score"),
+            "hrv_rmssd_milli": recovery_score.get("hrv_rmssd_milli"),
+            "updated_at": recovery.get("updated_at"),
+        },
+        "cycle": {
+            "score_state": cycle.get("score_state"),
+            "day_strain": cycle_score.get("strain"),
+            "start": cycle.get("start"),
+            "end": cycle.get("end"),
+            "updated_at": cycle.get("updated_at"),
+        },
+        "sleep": {
+            "score_state": sleep.get("score_state"),
+            "sleep_performance_percentage": sleep_score.get("sleep_performance_percentage"),
+            "sleep_duration_hours": sleep_duration,
+            "start": sleep.get("start"),
+            "end": sleep.get("end"),
+            "updated_at": sleep.get("updated_at"),
+        },
+    }
+    return result
+
+
+def weekly_trend(recoveries: list, cycles: list, sleeps: list) -> list:
+    cycles_by_id = {item.get("id"): item for item in cycles if item.get("id") is not None}
+    sleeps_by_cycle = {
+        item.get("cycle_id"): item
+        for item in sleeps
+        if item.get("cycle_id") is not None and not item.get("nap")
+    }
+    days = []
+    for recovery in recoveries[:7]:
+        cycle_id = recovery.get("cycle_id")
+        sleep = sleeps_by_cycle.get(cycle_id, {})
+        cycle = cycles_by_id.get(cycle_id, {})
+        recovery_score = recovery.get("score") or {}
+        sleep_score = sleep.get("score") or {}
+        cycle_score = cycle.get("score") or {}
+        stages = sleep_score.get("stage_summary") or {}
+        sleep_segments = [
+            stages.get("total_light_sleep_time_milli"),
+            stages.get("total_slow_wave_sleep_time_milli"),
+            stages.get("total_rem_sleep_time_milli"),
+        ]
+        sleep_duration = hours(sum(value or 0 for value in sleep_segments)) if any(
+            isinstance(value, (int, float)) for value in sleep_segments
+        ) else None
+        date_source = sleep.get("end") or recovery.get("created_at") or cycle.get("start") or ""
+        days.append(
+            {
+                "date": date_source[:10],
+                "recovery_score": recovery_score.get("recovery_score"),
+                "hrv_rmssd_milli": recovery_score.get("hrv_rmssd_milli"),
+                "sleep_performance_percentage": sleep_score.get("sleep_performance_percentage"),
+                "sleep_duration_hours": sleep_duration,
+                "day_strain": cycle_score.get("strain"),
+            }
+        )
+    days.reverse()
+    return days
+
+
+def command_configure(args) -> None:
+    client_id = args.client_id or input("WHOOP Client ID: ").strip()
+    if not client_id:
+        raise RuntimeError("Client ID is required")
+    client_secret = getpass.getpass("WHOOP Client Secret (stored in OS keyring): ").strip()
+    if not client_secret:
+        raise RuntimeError("Client Secret is required")
+    keyring_store("client-secret", client_secret)
+    save_config(
+        {
+            "client_id": client_id,
+            "redirect_uri": REDIRECT_URI,
+            "requested_scopes": SCOPES,
+        }
+    )
+    print("WHOOP client saved securely. Run: whoop-bridge authorize")
+
+
+def command_authorize(_args) -> None:
+    config = load_config()
+    client_id = config.get("client_id", "")
+    if not client_id or not keyring_lookup("client-secret"):
+        raise RuntimeError("Run the plugin setup first")
+    state = secrets.token_hex(4)
+    config["pending_state"] = state
+    config["pending_state_expires_at"] = int(time.time()) + 600
+    save_config(config)
+    query = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": REDIRECT_URI,
+            "response_type": "code",
+            "scope": " ".join(SCOPES),
+            "state": state,
+        }
+    )
+    subprocess.run(["xdg-open", f"{AUTH_URL}?{query}"], check=True)
+    print("WHOOP authorization opened in your browser.")
+
+
+def command_callback(args) -> None:
+    log_callback("callback received")
+    parsed = urllib.parse.urlparse(args.url)
+    values = urllib.parse.parse_qs(parsed.query)
+    if values.get("error"):
+        raise RuntimeError(f"WHOOP authorization failed: {values['error'][0]}")
+    code = values.get("code", [""])[0]
+    returned_state = values.get("state", [""])[0]
+    config = load_config()
+    if not code:
+        raise RuntimeError("WHOOP callback did not include an authorization code")
+    if (
+        not returned_state
+        or returned_state != config.get("pending_state")
+        or int(config.get("pending_state_expires_at", 0)) < int(time.time())
+    ):
+        raise RuntimeError("WHOOP callback state was invalid or expired")
+    try:
+        payload = token_request(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": config["client_id"],
+                "client_secret": keyring_lookup("client-secret"),
+                "redirect_uri": REDIRECT_URI,
+            }
+        )
+    except WhoopHttpError as error:
+        log_callback(f"token exchange HTTP {error.status}")
+        raise
+    save_tokens(payload)
+    log_callback("token saved")
+    command_sync(args)
+    log_callback("initial sync complete")
+    subprocess.run(
+        ["notify-send", "WHOOP connected", "Personal OS received a current WHOOP summary."],
+        check=False,
+    )
+
+
+def command_sync(_args) -> None:
+    token = current_access_token()
+    recovery_payload = api_get("/recovery?limit=7", token)
+    cycle_payload = api_get("/cycle?limit=7", token)
+    sleep_payload = api_get("/activity/sleep?limit=14", token)
+    recovery = first_record(recovery_payload)
+    cycle = first_record(cycle_payload)
+    sleep = first_record(sleep_payload, lambda item: not item.get("nap"))
+    if not (recovery or cycle or sleep):
+        raise RuntimeError("WHOOP returned no current recovery, cycle, or sleep records")
+    summary = compact_summary(recovery, cycle, sleep)
+    summary["weekly_trend"] = weekly_trend(
+        recovery_payload.get("records", []),
+        cycle_payload.get("records", []),
+        sleep_payload.get("records", []),
+    )
+    write_private_json(STATE_FILE, summary)
+    print(json.dumps(summary, indent=2, sort_keys=True))
+
+
+def command_status(_args) -> None:
+    config = load_config()
+    summary = read_json(STATE_FILE, {})
+    status = {
+        "configured": bool(config.get("client_id") and keyring_lookup("client-secret")),
+        "authorized": bool(keyring_lookup("refresh-token")),
+        "requested_scopes": config.get("requested_scopes", SCOPES),
+        "last_sync": summary.get("fetched_at"),
+        "state_file": str(STATE_FILE),
+    }
+    print(json.dumps(status, indent=2, sort_keys=True))
+
+
+def command_disconnect(_args) -> None:
+    for key in ("access-token", "refresh-token", "client-secret"):
+        keyring_clear(key)
+    for path in (STATE_FILE, CALLBACK_LOG, CONFIG_FILE):
+        path.unlink(missing_ok=True)
+    print("WHOOP access and local cached data removed.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Private WHOOP bridge for Personal OS")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    configure = subparsers.add_parser("configure", help="Store WHOOP client credentials")
+    configure.add_argument("client_id", nargs="?")
+    configure.set_defaults(func=command_configure)
+
+    authorize = subparsers.add_parser("authorize", help="Open the WHOOP consent flow")
+    authorize.set_defaults(func=command_authorize)
+
+    callback = subparsers.add_parser("callback", help=argparse.SUPPRESS)
+    callback.add_argument("url")
+    callback.set_defaults(func=command_callback)
+
+    sync = subparsers.add_parser("sync", help="Refresh the local WHOOP summary")
+    sync.set_defaults(func=command_sync)
+
+    status = subparsers.add_parser("status", help="Show connection status without secrets")
+    status.set_defaults(func=command_status)
+
+    disconnect = subparsers.add_parser("disconnect", help="Remove tokens, credentials, and cached WHOOP data")
+    disconnect.set_defaults(func=command_disconnect)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        args.func(args)
+        return 0
+    except (RuntimeError, urllib.error.URLError, subprocess.CalledProcessError) as error:
+        if getattr(args, "command", "") == "callback":
+            log_callback(f"callback failed: {type(error).__name__}")
+        print(f"omarchy-whoop: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

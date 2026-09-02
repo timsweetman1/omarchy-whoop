@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Omarchy WHOOP
+Comment=Complete WHOOP OAuth locally for the Omarchy WHOOP plugin
+Exec=@PLUGIN_ROOT@/bin/whoop-bridge callback %u
+NoDisplay=true
+Terminal=false
+MimeType=x-scheme-handler/whoop;

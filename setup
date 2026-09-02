@@ -1,0 +1,46 @@
+#!/bin/bash
+
+set -euo pipefail
+
+plugin_root="$(cd "$(dirname "$0")" && pwd)"
+desktop_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+desktop_file="$desktop_dir/io.github.timsweetman1.whoop.desktop"
+
+missing=()
+for command_name in curl jq secret-tool xdg-open update-desktop-database python; do
+  command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+done
+
+if (( ${#missing[@]} > 0 )); then
+  printf 'Installing required packages for: %s\n' "${missing[*]}"
+  omarchy pkg add curl jq libsecret xdg-utils desktop-file-utils python
+fi
+
+mkdir -p "$desktop_dir"
+sed "s|@PLUGIN_ROOT@|$plugin_root|g" "$plugin_root/omarchy-whoop.desktop.in" > "$desktop_file"
+chmod 644 "$desktop_file"
+update-desktop-database "$desktop_dir"
+xdg-mime default io.github.timsweetman1.whoop.desktop x-scheme-handler/whoop
+
+cat <<'INSTRUCTIONS'
+
+Create a WHOOP developer app at https://developer-dashboard.whoop.com/apps/create
+
+Use these values:
+  App name:       Omarchy WHOOP
+  Privacy policy: https://github.com/timsweetman1/omarchy-whoop/blob/main/PRIVACY.md
+  Redirect URL:   whoop://omarchy-whoop/callback
+  Scopes:         read:recovery, read:cycles, read:sleep
+
+Do not enable profile, body measurement, or workout access.
+INSTRUCTIONS
+
+printf '\n'
+"$plugin_root/bin/whoop-bridge" configure
+
+printf '\nWHOOP is configured and the callback handler is registered.\n'
+read -r -p 'Open WHOOP authorization now? [Y/n] ' answer
+if [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]; then
+  "$plugin_root/bin/whoop-bridge" authorize
+  printf 'After granting access, choose Open Application in your browser.\n'
+fi
