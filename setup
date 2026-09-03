@@ -1,10 +1,12 @@
 #!/bin/bash
 
 set -euo pipefail
+umask 077
 
 plugin_root="$(cd "$(dirname "$0")" && pwd)"
 desktop_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 desktop_file="$desktop_dir/io.github.timsweetman1.whoop.desktop"
+handler="x-scheme-handler/omarchy-whoop"
 
 missing=()
 for command_name in curl jq secret-tool xdg-open update-desktop-database python; do
@@ -17,10 +19,23 @@ if (( ${#missing[@]} > 0 )); then
 fi
 
 mkdir -p "$desktop_dir"
-sed "s|@PLUGIN_ROOT@|$plugin_root|g" "$plugin_root/omarchy-whoop.desktop.in" > "$desktop_file"
+escaped_root="${plugin_root//\\/\\\\}"
+escaped_root="${escaped_root//&/\\&}"
+escaped_root="${escaped_root//|/\\|}"
+sed "s|@PLUGIN_ROOT@|$escaped_root|g" "$plugin_root/omarchy-whoop.desktop.in" > "$desktop_file"
 chmod 644 "$desktop_file"
 update-desktop-database "$desktop_dir"
-xdg-mime default io.github.timsweetman1.whoop.desktop x-scheme-handler/whoop
+xdg-mime default io.github.timsweetman1.whoop.desktop "$handler"
+registered_handler="$(xdg-mime query default "$handler")"
+if [[ "$registered_handler" != "io.github.timsweetman1.whoop.desktop" ]]; then
+  printf 'Could not register the local WHOOP callback handler.\n' >&2
+  exit 1
+fi
+
+if [[ "${1:-}" == "--register-only" ]]; then
+  printf 'WHOOP callback handler registered successfully.\n'
+  exit 0
+fi
 
 cat <<'INSTRUCTIONS'
 
@@ -29,7 +44,7 @@ Create a WHOOP developer app at https://developer-dashboard.whoop.com/apps/creat
 Use these values:
   App name:       Omarchy WHOOP
   Privacy policy: https://github.com/timsweetman1/omarchy-whoop/blob/main/PRIVACY.md
-  Redirect URL:   whoop://omarchy-whoop/callback
+  Redirect URL:   omarchy-whoop://oauth/callback
   Scopes:         read:recovery, read:cycles, read:sleep
 
 Do not enable profile, body measurement, or workout access.

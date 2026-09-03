@@ -32,5 +32,7 @@ integration through WHOOP.
 
 ## Contact
 
-Privacy questions and security reports may be opened at
-<https://github.com/timsweetman1/omarchy-whoop/issues>.
+Privacy questions may be opened at
+<https://github.com/timsweetman1/omarchy-whoop/issues>. Security reports that
+could contain sensitive information should use the private **Report a
+vulnerability** form on the repository's Security tab.

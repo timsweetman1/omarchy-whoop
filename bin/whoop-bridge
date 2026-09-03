@@ -5,11 +5,12 @@ import getpass
 import json
 import os
 import secrets
+import tempfile
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -18,7 +19,7 @@ SERVICE = "omarchy-whoop"
 AUTH_URL = "https://api.prod.whoop.com/oauth/oauth2/auth"
 TOKEN_URL = "https://api.prod.whoop.com/oauth/oauth2/token"
 API_ROOT = "https://api.prod.whoop.com/developer/v2"
-REDIRECT_URI = "whoop://omarchy-whoop/callback"
+REDIRECT_URI = "omarchy-whoop://oauth/callback"
 SCOPES = ["offline", "read:recovery", "read:cycles", "read:sleep"]
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / SERVICE
@@ -42,12 +43,24 @@ def read_json(path: Path, default=None):
 
 def write_private_json(path: Path, value) -> None:
     ensure_private_dir(path.parent)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    with temp.open("w", encoding="utf-8") as handle:
-        json.dump(value, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    temp.chmod(0o600)
-    temp.replace(path)
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(value, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        temp_path.chmod(0o600)
+        temp_path.replace(path)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def log_callback(message: str) -> None:
@@ -55,6 +68,10 @@ def log_callback(message: str) -> None:
     with CALLBACK_LOG.open("a", encoding="utf-8") as handle:
         handle.write(f"{datetime.now(timezone.utc).isoformat()} {message}\n")
     CALLBACK_LOG.chmod(0o600)
+    if CALLBACK_LOG.stat().st_size > 16_384:
+        recent_lines = CALLBACK_LOG.read_text(encoding="utf-8").splitlines()[-50:]
+        CALLBACK_LOG.write_text("\n".join(recent_lines) + "\n", encoding="utf-8")
+        CALLBACK_LOG.chmod(0o600)
 
 
 def keyring_lookup(key: str) -> str:
@@ -107,11 +124,28 @@ class WhoopHttpError(RuntimeError):
         self.status = status
 
 
+def validate_token(value: str, label: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        raise RuntimeError(f"WHOOP returned an invalid {label}")
+    if "\r" in value or "\n" in value:
+        raise RuntimeError(f"WHOOP returned an invalid {label}")
+    return value
+
+
 def curl_json(url: str, method: str = "GET", fields=None, bearer: str = "") -> dict:
     command = [
         "curl",
+        "--disable",
         "--silent",
         "--show-error",
+        "--proto",
+        "=https",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "30",
+        "--max-filesize",
+        "2097152",
         "--request",
         method,
         "--header",
@@ -133,15 +167,11 @@ def curl_json(url: str, method: str = "GET", fields=None, bearer: str = "") -> d
         )
         request_input = urllib.parse.urlencode(fields)
     else:
-        # Feed the bearer token through curl's stdin config so it never appears
-        # in the process list. GET requests have no body, so stdin is available.
-        safe_url = url.replace('"', "")
-        safe_token = bearer.replace('"', "")
-        command.extend(["--config", "-"])
-        request_input = (
-            f'url = "{safe_url}"\n'
-            f'header = "Authorization: Bearer {safe_token}"\n'
-        )
+        # Feed the bearer header through stdin so the token never appears in
+        # the process list. GET requests have no body, so stdin is available.
+        validate_token(bearer, "access token")
+        command.extend(["--header", "@-", "--url", url])
+        request_input = f"Authorization: Bearer {bearer}\n"
     result = subprocess.run(
         command,
         input=request_input,
@@ -153,7 +183,7 @@ def curl_json(url: str, method: str = "GET", fields=None, bearer: str = "") -> d
     if not separator or not status_text.isdigit():
         raise RuntimeError(f"WHOOP request failed: {result.stderr.strip() or 'invalid response'}")
     status = int(status_text)
-    if status >= 400:
+    if status < 200 or status >= 300:
         raise WhoopHttpError(status, raw.strip() or result.stderr.strip())
     try:
         return json.loads(raw)
@@ -162,19 +192,40 @@ def curl_json(url: str, method: str = "GET", fields=None, bearer: str = "") -> d
 
 
 def token_request(fields: dict) -> dict:
-    return curl_json(TOKEN_URL, method="POST", fields=fields)
+    try:
+        return curl_json(TOKEN_URL, method="POST", fields=fields)
+    except WhoopHttpError as error:
+        # Token endpoint errors must never echo submitted credentials.
+        raise WhoopHttpError(error.status, "token request was rejected") from error
 
 
-def save_tokens(payload: dict) -> None:
-    access_token = payload.get("access_token", "")
-    if not access_token:
-        raise RuntimeError("WHOOP did not return an access token")
-    keyring_store("access-token", access_token)
-    if payload.get("refresh_token"):
-        keyring_store("refresh-token", payload["refresh_token"])
+def save_tokens(payload: dict, require_refresh: bool = False) -> None:
+    if str(payload.get("token_type", "bearer")).lower() != "bearer":
+        raise RuntimeError("WHOOP returned an unsupported token type")
+    access_token = validate_token(payload.get("access_token", ""), "access token")
+    refresh_token = payload.get("refresh_token", "")
+    if refresh_token:
+        refresh_token = validate_token(refresh_token, "refresh token")
+    if require_refresh and not refresh_token:
+        raise RuntimeError("WHOOP did not return the required offline refresh token")
+    raw_scope = payload.get("scope")
+    if not isinstance(raw_scope, str):
+        raise RuntimeError("WHOOP did not return granted scopes")
+    granted_scopes = set(raw_scope.split())
+    if not set(SCOPES).issubset(granted_scopes):
+        raise RuntimeError("WHOOP did not grant all requested scopes")
+    try:
+        expires_in = int(payload["expires_in"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("WHOOP returned an invalid token lifetime") from error
+    if not 1 <= expires_in <= 86_400:
+        raise RuntimeError("WHOOP returned an invalid token lifetime")
     config = load_config()
-    config["token_expires_at"] = int(time.time()) + int(payload.get("expires_in", 3600))
-    config["authorized_scopes"] = payload.get("scope", " ".join(SCOPES)).split()
+    keyring_store("access-token", access_token)
+    if refresh_token:
+        keyring_store("refresh-token", refresh_token)
+    config["token_expires_at"] = int(time.time()) + expires_in
+    config["authorized_scopes"] = sorted(granted_scopes)
     config.pop("pending_state", None)
     config.pop("pending_state_expires_at", None)
     save_config(config)
@@ -319,12 +370,18 @@ def weekly_trend(recoveries: list, cycles: list, sleeps: list) -> list:
 
 
 def command_configure(args) -> None:
-    client_id = args.client_id or input("WHOOP Client ID: ").strip()
-    if not client_id:
-        raise RuntimeError("Client ID is required")
+    raw_client_id = args.client_id or input("WHOOP Client ID: ").strip()
+    try:
+        client_id = str(uuid.UUID(raw_client_id))
+    except (ValueError, AttributeError) as error:
+        raise RuntimeError("Client ID must be the UUID shown in the WHOOP developer dashboard") from error
     client_secret = getpass.getpass("WHOOP Client Secret (stored in OS keyring): ").strip()
-    if not client_secret:
-        raise RuntimeError("Client Secret is required")
+    if not 32 <= len(client_secret) <= 256 or any(character.isspace() for character in client_secret):
+        raise RuntimeError("Client Secret has an unexpected format")
+    old_client_id = load_config().get("client_id")
+    if old_client_id and old_client_id != client_id:
+        keyring_clear("access-token")
+        keyring_clear("refresh-token")
     keyring_store("client-secret", client_secret)
     save_config(
         {
@@ -341,7 +398,9 @@ def command_authorize(_args) -> None:
     client_id = config.get("client_id", "")
     if not client_id or not keyring_lookup("client-secret"):
         raise RuntimeError("Run the plugin setup first")
-    state = secrets.token_hex(4)
+    # WHOOP requires an eight-character state value. Six random bytes encode
+    # to eight URL-safe characters, providing more entropy than eight hex chars.
+    state = secrets.token_urlsafe(6)
     config["pending_state"] = state
     config["pending_state_expires_at"] = int(time.time()) + 600
     save_config(config)
@@ -360,21 +419,30 @@ def command_authorize(_args) -> None:
 
 def command_callback(args) -> None:
     log_callback("callback received")
+    if len(args.url) > 8192:
+        raise RuntimeError("WHOOP callback URL was too long")
     parsed = urllib.parse.urlparse(args.url)
-    values = urllib.parse.parse_qs(parsed.query)
+    if parsed.scheme != "omarchy-whoop" or parsed.netloc != "oauth" or parsed.path != "/callback":
+        raise RuntimeError("WHOOP callback target was invalid")
+    values = urllib.parse.parse_qs(parsed.query, max_num_fields=10)
     if values.get("error"):
         raise RuntimeError(f"WHOOP authorization failed: {values['error'][0]}")
     code = values.get("code", [""])[0]
     returned_state = values.get("state", [""])[0]
     config = load_config()
-    if not code:
+    if not code or len(code) > 4096:
         raise RuntimeError("WHOOP callback did not include an authorization code")
     if (
         not returned_state
-        or returned_state != config.get("pending_state")
+        or not secrets.compare_digest(returned_state, config.get("pending_state", ""))
         or int(config.get("pending_state_expires_at", 0)) < int(time.time())
     ):
         raise RuntimeError("WHOOP callback state was invalid or expired")
+    # Consume the state before exchanging the one-time code. A double click or
+    # replay must start a new authorization flow, even if the network fails.
+    config.pop("pending_state", None)
+    config.pop("pending_state_expires_at", None)
+    save_config(config)
     try:
         payload = token_request(
             {
@@ -388,12 +456,12 @@ def command_callback(args) -> None:
     except WhoopHttpError as error:
         log_callback(f"token exchange HTTP {error.status}")
         raise
-    save_tokens(payload)
+    save_tokens(payload, require_refresh=True)
     log_callback("token saved")
     command_sync(args)
     log_callback("initial sync complete")
     subprocess.run(
-        ["notify-send", "WHOOP connected", "Personal OS received a current WHOOP summary."],
+        ["notify-send", "WHOOP connected", "Omarchy received a current WHOOP summary."],
         check=False,
     )
 
@@ -440,7 +508,7 @@ def command_disconnect(_args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Private WHOOP bridge for Personal OS")
+    parser = argparse.ArgumentParser(description="Private local WHOOP bridge for Omarchy")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     configure = subparsers.add_parser("configure", help="Store WHOOP client credentials")
@@ -471,7 +539,7 @@ def main() -> int:
     try:
         args.func(args)
         return 0
-    except (RuntimeError, urllib.error.URLError, subprocess.CalledProcessError) as error:
+    except (RuntimeError, subprocess.CalledProcessError) as error:
         if getattr(args, "command", "") == "callback":
             log_callback(f"callback failed: {type(error).__name__}")
         print(f"omarchy-whoop: {error}", file=sys.stderr)

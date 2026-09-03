@@ -45,7 +45,7 @@ Create an app at <https://developer-dashboard.whoop.com/apps/create> with:
 |---|---|
 | App name | `Omarchy WHOOP` |
 | Privacy policy | `https://github.com/timsweetman1/omarchy-whoop/blob/main/PRIVACY.md` |
-| Redirect URL | `whoop://omarchy-whoop/callback` |
+| Redirect URL | `omarchy-whoop://oauth/callback` |
 | Scopes | `read:recovery`, `read:cycles`, `read:sleep` |
 
 Do not enable profile, body-measurement, or workout access. Paste the generated
@@ -69,7 +69,7 @@ The setup script installs missing Arch packages through `omarchy pkg add`.
 
 | Data | Location |
 |---|---|
-| Client ID and non-secret settings | `$XDG_CONFIG_HOME/omarchy-whoop/config.json` |
+| Client ID and settings | `$XDG_CONFIG_HOME/omarchy-whoop/config.json` (owner-only) |
 | Client secret and OAuth tokens | OS keyring under `service=omarchy-whoop` |
 | Compact dashboard cache | `$XDG_STATE_HOME/omarchy-whoop/latest.json` |
 | Privacy-safe callback status | `$XDG_STATE_HOME/omarchy-whoop/callback.log` |
@@ -95,6 +95,8 @@ omarchy plugin validate .
 python -m unittest discover -s tests -v
 ```
 
+Security issues should be reported privately as described in [SECURITY.md](SECURITY.md).
+
 ## Brand
 
 WHOOP is a trademark of WHOOP, Inc. The puck assets are the official files
@@ -104,5 +106,6 @@ by WHOOP, Inc.
 
 ## License
 
-Plugin source is available under the MIT License. WHOOP brand assets remain the
-property of WHOOP, Inc. and are subject to WHOOP's brand and API terms.
+Plugin source is available under the MIT License. As detailed in [NOTICE](NOTICE),
+WHOOP brand assets are excluded from that license and remain subject to WHOOP's
+brand and API terms.

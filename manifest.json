@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.timsweetman1.whoop",
   "name": "WHOOP",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Tim Sweetman",
   "license": "MIT",
   "description": "Private local WHOOP recovery, HRV, sleep, strain, and seven-day trends in the Omarchy bar.",
