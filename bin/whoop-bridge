@@ -4,6 +4,7 @@ import argparse
 import getpass
 import json
 import os
+import pwd
 import secrets
 import tempfile
 import subprocess
@@ -22,9 +23,10 @@ API_ROOT = "https://api.prod.whoop.com/developer/v2"
 REDIRECT_URI = "omarchy-whoop://oauth/callback"
 SCOPES = ["offline", "read:recovery", "read:cycles", "read:sleep"]
 
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / SERVICE
+USER_HOME = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+CONFIG_DIR = USER_HOME / ".config" / SERVICE
 CONFIG_FILE = CONFIG_DIR / "config.json"
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))) / SERVICE
+STATE_DIR = USER_HOME / ".local" / "state" / SERVICE
 STATE_FILE = STATE_DIR / "latest.json"
 CALLBACK_LOG = STATE_DIR / "callback.log"
 
@@ -499,6 +501,14 @@ def command_status(_args) -> None:
     print(json.dumps(status, indent=2, sort_keys=True))
 
 
+def command_detail(_args) -> None:
+    summary = read_json(STATE_FILE, {})
+    if summary:
+        print(json.dumps(summary, separators=(",", ":"), sort_keys=True))
+    else:
+        print('{"connected":false,"status":"Connect WHOOP"}')
+
+
 def command_disconnect(_args) -> None:
     for key in ("access-token", "refresh-token", "client-secret"):
         keyring_clear(key)
@@ -527,6 +537,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = subparsers.add_parser("status", help="Show connection status without secrets")
     status.set_defaults(func=command_status)
+
+    detail = subparsers.add_parser("detail", help="Read the local dashboard cache")
+    detail.set_defaults(func=command_detail)
 
     disconnect = subparsers.add_parser("disconnect", help="Remove tokens, credentials, and cached WHOOP data")
     disconnect.set_defaults(func=command_disconnect)

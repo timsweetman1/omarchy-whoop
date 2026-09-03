@@ -69,10 +69,10 @@ The setup script installs missing Arch packages through `omarchy pkg add`.
 
 | Data | Location |
 |---|---|
-| Client ID and settings | `$XDG_CONFIG_HOME/omarchy-whoop/config.json` (owner-only) |
+| Client ID and settings | `~/.config/omarchy-whoop/config.json` (owner-only) |
 | Client secret and OAuth tokens | OS keyring under `service=omarchy-whoop` |
-| Compact dashboard cache | `$XDG_STATE_HOME/omarchy-whoop/latest.json` |
-| Privacy-safe callback status | `$XDG_STATE_HOME/omarchy-whoop/callback.log` |
+| Compact dashboard cache | `~/.local/state/omarchy-whoop/latest.json` |
+| Privacy-safe callback status | `~/.local/state/omarchy-whoop/callback.log` |
 
 The callback log records only success/failure stages. It never records OAuth
 codes, tokens, client secrets, or health values.

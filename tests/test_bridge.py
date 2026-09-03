@@ -26,6 +26,18 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(target.parent.stat().st_mode), 0o700)
             self.assertEqual(list(target.parent.glob("*.tmp")), [])
 
+    def test_detail_never_reads_an_environment_selected_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trusted = Path(directory) / "trusted.json"
+            trusted.write_text('{"source":"trusted"}', encoding="utf-8")
+            with (
+                mock.patch.object(BRIDGE, "STATE_FILE", trusted),
+                mock.patch.dict("os.environ", {"XDG_STATE_HOME": "/tmp/untrusted"}),
+                mock.patch("builtins.print") as output,
+            ):
+                BRIDGE.command_detail(SimpleNamespace())
+            self.assertIn('"source":"trusted"', output.call_args.args[0])
+
     def test_validate_token_rejects_header_injection(self):
         for token in ("", "safe\r\nInjected: true", "x" * 8193):
             with self.subTest(token_length=len(token)):

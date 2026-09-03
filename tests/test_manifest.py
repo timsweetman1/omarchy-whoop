@@ -11,7 +11,7 @@ class ManifestTests(unittest.TestCase):
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["schemaVersion"], 1)
         self.assertEqual(manifest["id"], "io.github.timsweetman1.whoop")
-        self.assertEqual(manifest["version"], "0.1.1")
+        self.assertEqual(manifest["version"], "0.1.2")
         for relative_path in manifest["entryPoints"].values():
             self.assertTrue((ROOT / relative_path).is_file(), relative_path)
 
